@@ -1,103 +1,287 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"os"
-	"strconv"
-	"time"
-
-	"github.com/jackpal/bencode-go"
+	"path"
+	"strings"
 )
 
-type bencode_info struct {
-	Pieces      string `bencode:"pieces"`
-	PieceLength int    `bencode:"piece length"`
-	Length      int    `bencode:"length"`
-	Name        string `bencode:"name"`
-}
+// The .torrent metainfo layer.
+//
+// The one rule that matters here: the infohash is SHA-1 over the *info*
+// dictionary's original bytes. We therefore hash info.raw — the exact span the
+// bencode scanner consumed — rather than rebuilding the dictionary from a Go
+// struct and hashing that. Rebuilding silently discards `files`, `private`,
+// `source` and any vendor key, and fabricates `length` on multi-file torrents;
+// every one of those changes the digest and makes the client unroutable.
 
-type bencode_torrent struct {
-	Announce string       `bencode:"announce"`
-	Info     bencode_info `bencode:"info"`
+// file_entry is one payload file. Single-file torrents get exactly one
+// synthesised entry so that downstream code never needs to special-case them.
+type file_entry struct {
+	length int64
+	path   []string // validated relative components
+	offset int64    // absolute offset in the concatenated payload stream
 }
 
 type torrent_file struct {
-	announce     string
-	info_hash    [20]byte
-	piece_hashes [][20]byte
-	piece_length int
-	length       int
-	name         string
+	announce      string
+	announce_list [][]string
+	info_hash     [20]byte
+	info_raw      []byte // verbatim bencoded info dictionary
+	piece_hashes  [][20]byte
+	piece_length  int64
+	length        int64
+	name          string
+	files         []file_entry
+	multi         bool
+	private       bool
 }
 
-func open(path string) (torrent_file, error) {
-	f, err := os.Open(path)
+func open_torrent(file_path string) (*torrent_file, error) {
+	raw, err := os.ReadFile(file_path)
 	if err != nil {
-		return torrent_file{}, err
+		return nil, err
 	}
-	defer f.Close()
-
-	raw := &bencode_torrent{}
-
-	if err := bencode.Unmarshal(f, raw); err != nil {
-		return torrent_file{}, err
-	}
-
-	return raw.to_torrent_file()
-}
-
-func (b *bencode_torrent) to_torrent_file() (torrent_file, error) {
-	info_hash, err := b.Info.hash()
+	root, err := bdecode(raw)
 	if err != nil {
-		return torrent_file{}, err
+		return nil, fmt.Errorf("metainfo: %w", err)
+	}
+	return torrent_from_meta(root)
+}
+
+func torrent_from_meta(root *bnode) (*torrent_file, error) {
+	if root == nil || root.kind != bnode_dict {
+		return nil, errors.New("metainfo: top level value is not a dictionary")
 	}
 
-	piece_hashes, err := b.Info.split_piece_hashes()
+	announce := root.get("announce").as_string()
+
+	// announce-list (BEP 0012): a list of tiers, each tier a list of URLs.
+	var announce_list [][]string
+	if al := root.get("announce-list"); al != nil && al.kind == bnode_list {
+		for _, tier := range al.list {
+			if tier.kind != bnode_list {
+				continue
+			}
+			var urls []string
+			for _, item := range tier.list {
+				if s := item.as_string(); s != "" {
+					urls = append(urls, s)
+				}
+			}
+			if len(urls) > 0 {
+				announce_list = append(announce_list, urls)
+			}
+		}
+	}
+
+	return torrent_from_info(root.get("info"), announce, announce_list)
+}
+
+// torrent_from_info builds a torrent from an info dictionary alone. Magnet
+// resolution uses this: BEP 0009 hands over the info dictionary and nothing
+// else, so the tracker list has to come from the magnet link.
+func torrent_from_info(info *bnode, announce string, announce_list [][]string) (*torrent_file, error) {
+	if info == nil || info.kind != bnode_dict {
+		return nil, errors.New("metainfo: missing info dictionary")
+	}
+
+	t := &torrent_file{
+		announce:      announce,
+		announce_list: announce_list,
+		info_raw:      info.raw,
+		info_hash:     sha1.Sum(info.raw),
+	}
+
+	if len(t.info_raw) == 0 {
+		return nil, errors.New("metainfo: info dictionary has no bytes")
+	}
+
+	if priv := info.get("private"); priv != nil {
+		if v, err := priv.as_int(); err == nil && v == 1 {
+			t.private = true
+		}
+	}
+
+	t.name = info.get("name").as_string()
+	if t.name == "" {
+		t.name = "unnamed"
+	}
+
+	piece_length, err := info.get("piece length").as_int()
 	if err != nil {
-		return torrent_file{}, err
+		return nil, errors.New("metainfo: missing or invalid piece length")
+	}
+	if piece_length <= 0 {
+		return nil, fmt.Errorf("metainfo: piece length %d is not positive", piece_length)
+	}
+	t.piece_length = piece_length
+
+	pieces := info.get("pieces").as_bytes()
+	if pieces == nil {
+		return nil, errors.New("metainfo: missing pieces")
+	}
+	if len(pieces)%20 != 0 {
+		return nil, fmt.Errorf("metainfo: malformed pieces: %d bytes is not a multiple of 20", len(pieces))
+	}
+	t.piece_hashes = make([][20]byte, len(pieces)/20)
+	for i := range t.piece_hashes {
+		copy(t.piece_hashes[i][:], pieces[i*20:(i+1)*20])
 	}
 
-	return torrent_file{
-		announce:     b.Announce,
-		info_hash:    info_hash,
-		piece_hashes: piece_hashes,
-		piece_length: b.Info.PieceLength,
-		length:       b.Info.Length,
-		name:         b.Info.Name,
-	}, nil
+	files, total, multi, err := parse_files(info)
+	if err != nil {
+		return nil, err
+	}
+	t.files = files
+	t.length = total
+	t.multi = multi
+
+	if len(t.piece_hashes) == 0 && t.length > 0 {
+		return nil, errors.New("metainfo: no piece hashes for a non-empty payload")
+	}
+	want := (t.length + t.piece_length - 1) / t.piece_length
+	if int64(len(t.piece_hashes)) != want {
+		return nil, fmt.Errorf("metainfo: %d piece hashes does not match %d pieces of %d bytes",
+			len(t.piece_hashes), want, t.piece_length)
+	}
+
+	return t, nil
 }
 
-func (i *bencode_info) hash() ([20]byte, error) {
-	var buf bytes.Buffer
-
-	if err := bencode.Marshal(&buf, i); err != nil {
-		return [20]byte{}, err
+func parse_files(info *bnode) ([]file_entry, int64, bool, error) {
+	list := info.get("files")
+	if list == nil {
+		length, err := info.get("length").as_int()
+		if err != nil {
+			return nil, 0, false, errors.New("metainfo: single-file torrent has no length")
+		}
+		if length < 0 {
+			return nil, 0, false, errors.New("metainfo: negative length")
+		}
+		name := info.get("name").as_string()
+		if err := validate_path_component(name); err != nil {
+			return nil, 0, false, fmt.Errorf("metainfo: bad name %q: %w", name, err)
+		}
+		return []file_entry{{length: length, path: []string{name}}}, length, false, nil
 	}
 
-	return sha1.Sum(buf.Bytes()), nil
+	if list.kind != bnode_list {
+		return nil, 0, false, errors.New("metainfo: files is not a list")
+	}
+	if len(list.list) == 0 {
+		return nil, 0, false, errors.New("metainfo: files list is empty")
+	}
+
+	var files []file_entry
+	var offset int64
+	for i, entry := range list.list {
+		if entry.kind != bnode_dict {
+			return nil, 0, false, fmt.Errorf("metainfo: files[%d] is not a dictionary", i)
+		}
+		length, err := entry.get("length").as_int()
+		if err != nil {
+			return nil, 0, false, fmt.Errorf("metainfo: files[%d] has no length", i)
+		}
+		if length < 0 {
+			return nil, 0, false, fmt.Errorf("metainfo: files[%d] has negative length", i)
+		}
+
+		parts := entry.get("path")
+		if parts == nil || parts.kind != bnode_list || len(parts.list) == 0 {
+			return nil, 0, false, fmt.Errorf("metainfo: files[%d] has no path", i)
+		}
+		components := make([]string, 0, len(parts.list))
+		for _, part := range parts.list {
+			component := part.as_string()
+			if err := validate_path_component(component); err != nil {
+				return nil, 0, false, fmt.Errorf("metainfo: files[%d]: %w", i, err)
+			}
+			components = append(components, component)
+		}
+
+		files = append(files, file_entry{length: length, path: components, offset: offset})
+		offset += length
+	}
+	return files, offset, true, nil
 }
 
-func (i *bencode_info) split_piece_hashes() ([][20]byte, error) {
-	buf := []byte(i.Pieces)
-
-	if len(buf)%20 != 0 {
-		return nil, fmt.Errorf("malformed pieces: length %d not a multiple of 20", len(buf))
+// validate_path_component rejects anything that could escape the output
+// directory. A hostile torrent must not be able to write outside the tree.
+func validate_path_component(component string) error {
+	if component == "" {
+		return errors.New("empty path component")
 	}
-
-	n := len(buf) / 20
-	hashes := make([][20]byte, n)
-
-	for j := 0; j < n; j++ {
-		copy(hashes[j][:], buf[j*20:(j+1)*20])
+	if component == "." || component == ".." {
+		return errors.New("relative path component")
 	}
-	return hashes, nil
+	if strings.ContainsAny(component, `/\`) {
+		return errors.New("path component contains a separator")
+	}
+	if strings.ContainsRune(component, 0) {
+		return errors.New("path component contains a NUL")
+	}
+	if path.IsAbs(component) {
+		return errors.New("absolute path component")
+	}
+	return nil
+}
+
+func (t *torrent_file) num_pieces() int {
+	return len(t.piece_hashes)
+}
+
+// piece_size is the on-wire length of a piece. The final piece is usually
+// short; if it is not, the metainfo was inconsistent and we said so already.
+func (t *torrent_file) piece_size(index int) int64 {
+	begin := int64(index) * t.piece_length
+	if begin >= t.length {
+		return 0
+	}
+	remaining := t.length - begin
+	if remaining < t.piece_length {
+		return remaining
+	}
+	return t.piece_length
+}
+
+func (t *torrent_file) piece_offset(index int) int64 {
+	return int64(index) * t.piece_length
+}
+
+func (t *torrent_file) block_count(index int) int {
+	return int((t.piece_size(index) + block_size - 1) / block_size)
+}
+
+// info_dict returns the verbatim info dictionary, which is what BEP 0009
+// metadata exchange hands to magnet peers.
+func (t *torrent_file) info_dict() []byte {
+	return t.info_raw
+}
+
+// tracker_urls flattens announce plus announce-list tiers, keeping tier order.
+func (t *torrent_file) tracker_urls() []string {
+	var urls []string
+	seen := make(map[string]bool)
+	add := func(u string) {
+		if u == "" || seen[u] {
+			return
+		}
+		seen[u] = true
+		urls = append(urls, u)
+	}
+	add(t.announce)
+	for _, tier := range t.announce_list {
+		for _, u := range tier {
+			add(u)
+		}
+	}
+	return urls
 }
 
 type peer struct {
@@ -105,68 +289,37 @@ type peer struct {
 	port uint16
 }
 
-func unmarshal_peers(data []byte) ([]peer, error) {
-	if len(data)%6 != 0 {
-		return nil, fmt.Errorf("malformed peers: length %d not a multiple of 6", len(data))
-	}
-
-	n := len(data) / 6
-	peers := make([]peer, n)
-
-	for i := 0; i < n; i++ {
-		copy(peers[i].ip[:], data[i*6:i*6+4])
-		peers[i].port = binary.BigEndian.Uint16(data[i*6+4 : i*6+6])
-	}
-	return peers, nil
-}
-
 func (p peer) String() string {
 	return fmt.Sprintf("%d.%d.%d.%d:%d", p.ip[0], p.ip[1], p.ip[2], p.ip[3], p.port)
 }
 
-func (t *torrent_file) request_peers(peer_id [20]byte, port uint16) ([]peer, error) {
-	base, err := url.Parse(t.announce)
-	if err != nil {
-		return nil, err
+// unmarshal_peers decodes the compact form (BEP 0023): 6 bytes per peer.
+func unmarshal_peers(data []byte) ([]peer, error) {
+	if len(data)%6 != 0 {
+		return nil, fmt.Errorf("malformed peers: length %d is not a multiple of 6", len(data))
 	}
 
-	params := url.Values{
-		"info_hash":  []string{string(t.info_hash[:])},
-		"peer_id":    []string{string(peer_id[:])},
-		"port":       []string{strconv.Itoa(int(port))},
-		"uploaded":   []string{"0"},
-		"downloaded": []string{"0"},
-		"compact":    []string{"1"},
-		"left":       []string{strconv.Itoa(t.length)},
-		"numwant":    []string{"100"},
+	peers := make([]peer, 0, len(data)/6)
+	for i := 0; i+6 <= len(data); i += 6 {
+		p := peer{port: binary.BigEndian.Uint16(data[i+4 : i+6])}
+		copy(p.ip[:], data[i:i+4])
+		if p.port == 0 || p.ip == [4]byte{} {
+			continue
+		}
+		peers = append(peers, p)
 	}
-
-	base.RawQuery = params.Encode()
-	http_client := &http.Client{Timeout: 15 * time.Second}
-
-	response, err := http_client.Get(base.String())
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var tracker_resp struct {
-		Peers string `bencode:"peers"`
-	}
-
-	if err := bencode.Unmarshal(bytes.NewReader(body), &tracker_resp); err != nil {
-		return nil, err
-	}
-	return unmarshal_peers([]byte(tracker_resp.Peers))
+	return peers, nil
 }
 
+// new_peer_id builds an Azureus-style peer id so the swarm can identify us.
 func new_peer_id() ([20]byte, error) {
 	var id [20]byte
-	_, err := rand.Read(id[:])
-	return id, err
+	copy(id[:], []byte("-TC0001-"))
+	if _, err := rand.Read(id[8:]); err != nil {
+		return id, err
+	}
+	for i := 8; i < 20; i++ {
+		id[i] = 'a' + id[i]%26
+	}
+	return id, nil
 }
